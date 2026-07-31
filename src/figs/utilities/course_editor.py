@@ -19,27 +19,31 @@ import json
 import math
 import threading
 import time
+import tempfile
 from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any
 
 _ROWS = ("x", "y", "z", "yaw")
-_MIN_DERIVATIVES = 3  # Position/yaw, velocity/yaw-rate, acceleration/yaw-acceleration.
+_MIN_DERIVATIVES = 4  # d0 through d3 are always exposed in the editor.
 
 
 def _to_editor_value(row: int, value: float) -> float:
-    """Convert canonical JSON coordinates to the editor's displayed frame."""
+    """Convert canonical FLU values to the editor's rendered FRD frame."""
     return -value if row in (1, 2, 3) else value
 
 
 def _from_editor_value(row: int, value: float) -> float:
-    """Convert an editor value back to the canonical JSON coordinate frame."""
+    """Convert a rendered FRD value back to canonical JSON coordinates."""
     return -value if row in (1, 2, 3) else value
 
 
 def _new_course() -> dict[str, Any]:
     """Return a minimal, solver-compatible course with two editable poses."""
-    frame = {"t": 0.0, "fo": [[0.0, None, None], [0.0, None, None], [0.0, None, None], [0.0, None, None]]}
+    frame = {
+        "t": 0.0,
+        "fo": [[0.0, None, None, None], [0.0, None, None, None], [0.0, None, None, None], [0.0, None, None, None]],
+    }
     return {
         "waypoints": {
             "Nco": 6,
@@ -92,7 +96,10 @@ def _normalise_course(course: MutableMapping[str, Any]) -> tuple[dict[str, Any],
 
 
 def _yaw_to_wxyz(yaw: float) -> tuple[float, float, float, float]:
-    return (math.cos(yaw / 2.0), 0.0, 0.0, math.sin(yaw / 2.0))
+    """Return the FRD pose quaternion: rendered yaw plus a fixed 180° roll."""
+    half_yaw = yaw / 2.0
+    # q = q_yaw * q_roll(pi), so the body frame is forward-right-down.
+    return (0.0, math.cos(half_yaw), math.sin(half_yaw), 0.0)
 
 
 def _wxyz_to_yaw(wxyz: tuple[float, float, float, float] | np.ndarray) -> float:
@@ -112,6 +119,7 @@ class CourseEditor:
         port: int,
         server: Any | None = None,
         scene_scale: float = 1.0,
+        gsplat: Any | None = None,
     ) -> None:
         import numpy as np
         import viser
@@ -123,9 +131,16 @@ class CourseEditor:
         self.output_path = output_path
         self.server = server if server is not None else viser.ViserServer(host=host, port=port)
         self.scene_scale = scene_scale
+        self.gsplat = gsplat
         self.lock = threading.RLock()
         self._syncing_gui = False
         self.pose_handles: dict[str, Any] = {}
+        self.simulated_tro: Any | None = None
+        self.simulated_xro: Any | None = None
+        self.simulated_rgb: Any | None = None
+        self.simulation_hz: int | None = None
+        self.show_simulated_trajectory = False
+        self.speed_markers_handle: Any | None = None
         self.selection = next(iter(self.keyframes))
 
         self.server.scene.add_grid(
@@ -148,7 +163,27 @@ class CourseEditor:
             self.delete_button.on_click(lambda _: self._delete_selected())
             self.save_button = self.server.gui.add_button("Save JSON", color="green")
             self.save_button.on_click(lambda _: self._save())
+            self.simulate_button = self.server.gui.add_button(
+                "Run FiGS simulation", disabled=self.gsplat is None,
+                hint="Run the Section 4 FiGS simulator using the current course and Gaussian splat.",
+            )
+            self.simulate_button.on_click(lambda _: self._run_simulation())
+            self.route_toggle_button = self.server.gui.add_button("Show simulated trajectory", disabled=True)
+            self.route_toggle_button.on_click(lambda _: self._toggle_route_display())
             self.status = self.server.gui.add_markdown("")
+
+        with self.server.gui.add_folder("Simulation display"):
+            self.speed_marker_period_gui = self.server.gui.add_number(
+                "Speed marker period (s)", initial_value=1.0, min=0.01, step=0.1,
+                hint="Time between simulated-trajectory speed markers.",
+            )
+            self.speed_marker_period_gui.on_update(lambda _: self._refresh_simulation_render())
+            self.server.gui.add_markdown("Speed markers: blue = slower, red = faster.")
+            self.video_output_gui = self.server.gui.add_text(
+                "Simulation video (.mp4)", initial_value=str(self.output_path.with_suffix(".mp4")),
+            )
+            self.export_video_button = self.server.gui.add_button("Export simulation video", disabled=True)
+            self.export_video_button.on_click(lambda _: self._export_simulation_video())
 
         with self.server.gui.add_folder("Selected keypoint"):
             self.time_gui = self.server.gui.add_number("Time (s)", initial_value=0.0, step=0.01)
@@ -171,7 +206,11 @@ class CourseEditor:
 
     def _select(self, name: str) -> None:
         with self.lock:
+            if name == self.selection:
+                return
             self.selection = name
+            # Keep the side-pane selection in sync when a rendered pose is clicked.
+            self.selected_gui.value = name
             self._refresh_gui()
             self._redraw_scene()
 
@@ -244,15 +283,13 @@ class CourseEditor:
             for index, (name, frame) in enumerate(ordered):
                 position, wxyz = self._pose(name)
                 positions.append(position)
-                self.pose_handles[name] = self.server.scene.add_frame(
+                pose_handle = self.server.scene.add_frame(
                     f"/course/keypoints/{name}", position=position, wxyz=wxyz,
                     axes_length=0.45 * self.scene_scale, axes_radius=0.015 * self.scene_scale, show_axes=True,
                 )
-            if len(positions) >= 2:
-                points = self.np.asarray([[positions[i], positions[i + 1]] for i in range(len(positions) - 1)])
-                self.server.scene.add_line_segments("/course/route", points=points, colors=(80, 190, 255), line_width=3.0)
-            else:
-                self.server.scene.add_line_segments("/course/route", points=self.np.empty((0, 2, 3)), colors=(80, 190, 255), line_width=3.0)
+                pose_handle.on_click(lambda _, keyframe_name=name: self._select(keyframe_name))
+                self.pose_handles[name] = pose_handle
+            self._update_route()
 
             position, wxyz = self._pose(self.selection)
             gizmo = self.server.scene.add_transform_controls(
@@ -276,9 +313,135 @@ class CourseEditor:
                 self._update_route()
 
     def _update_route(self) -> None:
+        if self.show_simulated_trajectory and self.simulated_tro is not None and self.simulated_xro is not None:
+            self._draw_simulated_route()
+            return
         positions = [self._pose(name)[0] for name in self.keyframes]
         points = self.np.asarray([[positions[i], positions[i + 1]] for i in range(len(positions) - 1)]) if len(positions) >= 2 else self.np.empty((0, 2, 3))
         self.server.scene.add_line_segments("/course/route", points=points, colors=(80, 190, 255), line_width=3.0)
+        if self.speed_markers_handle is not None:
+            self.speed_markers_handle.remove()
+            self.speed_markers_handle = None
+
+    def _draw_simulated_route(self) -> None:
+        """Render the rollout and color periodic samples by translational speed."""
+        assert self.simulated_tro is not None and self.simulated_xro is not None
+        positions = self.simulated_xro[:, 0:3].copy()
+        positions[:, 1:3] *= -1.0
+        positions *= self.scene_scale
+        points = (
+            self.np.stack((positions[:-1], positions[1:]), axis=1)
+            if len(positions) >= 2 else self.np.empty((0, 2, 3))
+        )
+        self.server.scene.add_line_segments(
+            "/course/route", points=points, colors=(255, 170, 50), line_width=3.0,
+        )
+
+        period = max(float(self.speed_marker_period_gui.value), 0.01)
+        sample_times = self.np.arange(self.simulated_tro[0], self.simulated_tro[-1] + period, period)
+        sample_indices = self.np.unique(self.np.clip(self.np.searchsorted(self.simulated_tro, sample_times), 0, len(positions) - 1))
+        marker_positions = positions[sample_indices]
+        speeds = self.np.linalg.norm(self.simulated_xro[sample_indices, 3:6], axis=1)
+        speed_range = float(speeds.max() - speeds.min()) if len(speeds) else 0.0
+        normalized = (speeds - speeds.min()) / speed_range if speed_range > 1e-9 else self.np.zeros_like(speeds)
+        colors = self.np.column_stack((255.0 * normalized, 80.0 + 120.0 * (1.0 - normalized), 255.0 * (1.0 - normalized))).astype(self.np.uint8)
+        if self.speed_markers_handle is not None:
+            self.speed_markers_handle.remove()
+        self.speed_markers_handle = self.server.scene.add_point_cloud(
+            "/course/simulation_speed_markers", points=marker_positions, colors=colors,
+            point_size=0.12 * self.scene_scale, point_shape="circle",
+        )
+
+    def _refresh_simulation_render(self) -> None:
+        if self.simulated_tro is not None:
+            with self.lock:
+                self._draw_simulated_route()
+
+    def _toggle_route_display(self) -> None:
+        with self.lock:
+            if self.simulated_tro is None or self.simulated_xro is None:
+                self.status.content = "Run a simulation before showing its trajectory."
+                return
+            self.show_simulated_trajectory = not self.show_simulated_trajectory
+            self.route_toggle_button.label = (
+                "Show keypoint route" if self.show_simulated_trajectory else "Show simulated trajectory"
+            )
+            self._update_route()
+            self.status.content = (
+                "Showing simulated trajectory and speed markers."
+                if self.show_simulated_trajectory else "Showing editable keypoint route."
+            )
+
+    def _export_simulation_video(self) -> None:
+        if self.simulated_rgb is None or self.simulation_hz is None:
+            self.status.content = "Run a simulation before exporting a video."
+            return
+        output_path = Path(self.video_output_gui.value)
+        if output_path.suffix.lower() != ".mp4":
+            self.status.content = "Simulation video path must end with .mp4."
+            return
+        self.export_video_button.disabled = True
+        self.status.content = f"Exporting simulation video to {output_path}…"
+        try:
+            from figs.visualize.generate_videos import images_to_mp4
+
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            images_to_mp4(self.simulated_rgb, str(output_path), self.simulation_hz)
+            self.status.content = f"Saved simulation video to `{output_path}`"
+            print(f"Saved simulation video to {output_path}")
+        except Exception as exc:
+            self.status.content = f"Video export failed: {exc}"
+            print(f"Video export failed: {exc}")
+        finally:
+            self.export_video_button.disabled = False
+
+    def _write_course(self, path: Path) -> None:
+        with path.open("w", encoding="utf-8") as file:
+            json.dump(self.course, file, indent=2, allow_nan=False)
+            file.write("\n")
+
+    def _run_simulation(self) -> None:
+        if self.gsplat is None:
+            self.status.content = "Simulation requires --gsplat-config."
+            return
+        self.simulate_button.disabled = True
+        self.status.content = "Running FiGS simulation…"
+        temporary_path: Path | None = None
+        try:
+            # The controller receives the serialized editor state, rather than
+            # a mutable reference to the live editor model.
+            with self.lock:
+                with tempfile.NamedTemporaryFile(prefix="figs-course-editor-", suffix=".json", delete=False, mode="w", encoding="utf-8") as file:
+                    temporary_path = Path(file.name)
+                self._write_course(temporary_path)
+            with temporary_path.open(encoding="utf-8") as file:
+                simulation_course = json.load(file)
+
+            from figs.control.vehicle_rate_mpc import VehicleRateMPC
+            from figs.simulator import Simulator
+
+            simulator = Simulator(self.gsplat, "eval_single", "carl")
+            controller = VehicleRateMPC("Viper", simulation_course, "carl")
+            t0, tf = controller.tXUd[0, 0], controller.tXUd[-1, 0]
+            tro, xro, _, _, rgb, _, _ = simulator.simulate(controller, t0, tf, controller.tXUd[0, 1:11])
+            with self.lock:
+                self.simulated_tro = tro
+                self.simulated_xro = xro
+                self.simulated_rgb = rgb
+                self.simulation_hz = int(controller.hz)
+                self.show_simulated_trajectory = True
+                self.route_toggle_button.disabled = False
+                self.route_toggle_button.label = "Show keypoint route"
+                self.export_video_button.disabled = False
+                self._draw_simulated_route()
+                self.status.content = "Simulation complete. Showing simulated trajectory and speed markers."
+        except Exception as exc:
+            self.status.content = f"Simulation failed: {exc}"
+            print(f"Simulation failed: {exc}")
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            self.simulate_button.disabled = False
 
     def _add_keypoint(self) -> None:
         with self.lock:
@@ -306,9 +469,7 @@ class CourseEditor:
     def _save(self) -> None:
         with self.lock:
             self.output_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.output_path.open("w", encoding="utf-8") as file:
-                json.dump(self.course, file, indent=2, allow_nan=False)
-                file.write("\n")
+            self._write_course(self.output_path)
             self.status.content = f"Saved `{self.output_path}`"
             print(f"Saved {self.output_path}")
 
@@ -342,6 +503,7 @@ def _start_ns_viewer(config_path: Path, host: str, port: int) -> tuple[Any, Any]
     # Import it only after eval_setup has completed that configuration import;
     # importing writer first creates a base_config <-> writer import cycle.
     from nerfstudio.utils import writer
+    from figs.render.gsplat import GSplat
 
     config, pipeline, _, step = eval_setup(config_path, eval_num_rays_per_chunk=None, test_mode="test")
     config.viewer.websocket_host = host
@@ -366,14 +528,35 @@ def _start_ns_viewer(config_path: Path, host: str, port: int) -> tuple[Any, Any]
         train_state="completed",
         eval_dataset=pipeline.datamanager.eval_dataset,
     )
+    # Keep Nerfstudio's renderer, but present the editor as the only UI and
+    # avoid obscuring the course with its dataset-camera frustums.
+    viewer.set_camera_visibility(False)
+    # Do not call ``gui.reset()`` here: viser 1.0.30 raises while removing a
+    # populated tab group. Hiding the root handles keeps Nerfstudio's render
+    # state intact but removes its controls from the side panel.
+    root_gui = viewer.viser_server.gui._container_handle_from_uuid["root"]
+    for handle in tuple(root_gui._children.values()):
+        if hasattr(handle, "visible"):
+            handle.visible = False
+    viewer.viser_server.gui.set_panel_label("Drone course editor")
+    viewer.viser_server.gui.configure_theme(
+        titlebar_content=None,
+        control_layout="collapsible",
+        dark_mode=True,
+        show_logo=False,
+        show_share_button=False,
+    )
     viewer.update_scene(step=step)
+    viewer.gsplat = GSplat.from_pipeline(config, pipeline)
     return viewer.viser_server, viewer
 
 
 def main() -> None:
     args = _parse_args()
-    if args.input is None:
+    if args.input is None or not args.input.exists():
         course = _new_course()
+        if args.input is not None:
+            print(f"Creating new course at {args.input}")
     else:
         try:
             with args.input.open(encoding="utf-8") as file:
@@ -397,7 +580,7 @@ def main() -> None:
             raise SystemExit(f"Unable to start Nerfstudio viewer: {exc}") from exc
         editor = CourseEditor(
             course, derivative_count, output_path, args.host, args.port,
-            server=server, scene_scale=10.0,
+            server=server, scene_scale=10.0, gsplat=viewer.gsplat,
         )
         # Keep both owners alive; the editor adds its controls to the viewer's server.
         editor.ns_viewer = viewer
