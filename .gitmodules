@@ -1,6 +1,6 @@
 [submodule "acados"]
 	path = acados
 	url = https://github.com/StanfordMSL/acados.git
-[submodule "Hierarchical-Localization"]
-	path = Hierarchical-Localization
-	url = https://github.com/cvg/Hierarchical-Localization.git
+[submodule "nerfstudio"]
+	path = nerfstudio
+	url = https://github.com/sdencanted/nerfstudio
