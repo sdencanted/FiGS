@@ -24,6 +24,7 @@ from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any
 
+
 _ROWS = ("x", "y", "z", "yaw")
 _MIN_DERIVATIVES = 4  # d0 through d3 are always exposed in the editor.
 
@@ -107,6 +108,11 @@ def _wxyz_to_yaw(wxyz: tuple[float, float, float, float] | np.ndarray) -> float:
     return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
+def _unwrap_angle(angle: float, reference: float) -> float:
+    """Return the 2π-equivalent angle closest to ``reference``."""
+    return reference + (angle - reference + math.pi) % (2.0 * math.pi) - math.pi
+
+
 class CourseEditor:
     """Own the course model and keep Viser handles synchronised with it."""
 
@@ -186,6 +192,17 @@ class CourseEditor:
             self.export_video_button.on_click(lambda _: self._export_simulation_video())
 
         with self.server.gui.add_folder("Selected keypoint"):
+            self.name_gui = self.server.gui.add_text("Keypoint name", initial_value=self.selection)
+            self.name_gui.on_update(lambda _: self._rename_selected())
+            with self.server.gui.add_folder("Order"):
+                self.move_first_button = self.server.gui.add_button("Move to first")
+                self.move_first_button.on_click(lambda _: self._move_selected(0, first=True))
+                self.move_earlier_button = self.server.gui.add_button("Move earlier")
+                self.move_earlier_button.on_click(lambda _: self._move_selected(-1))
+                self.move_later_button = self.server.gui.add_button("Move later")
+                self.move_later_button.on_click(lambda _: self._move_selected(1))
+                self.move_last_button = self.server.gui.add_button("Move to last")
+                self.move_last_button.on_click(lambda _: self._move_selected(-1, last=True))
             self.time_gui = self.server.gui.add_number("Time (s)", initial_value=0.0, step=0.01)
             self.time_gui.on_update(lambda _: self._set_time(float(self.time_gui.value)))
             self.value_guis: list[list[tuple[Any, Any]]] = []
@@ -218,6 +235,7 @@ class CourseEditor:
         self._syncing_gui = True
         try:
             frame = self._current()
+            self.name_gui.value = self.selection
             self.time_gui.value = float(frame["t"])
             for row_index, row_guis in enumerate(self.value_guis):
                 for derivative, (specified, value) in enumerate(row_guis):
@@ -228,8 +246,66 @@ class CourseEditor:
                         # Numeric controls always show the canonical JSON value.
                         value.value = float(saved)
             self.delete_button.disabled = len(self.keyframes) <= 1
+            selected_index = list(self.keyframes).index(self.selection)
+            last_index = len(self.keyframes) - 1
+            self.move_first_button.disabled = selected_index == 0
+            self.move_earlier_button.disabled = selected_index == 0
+            self.move_later_button.disabled = selected_index == last_index
+            self.move_last_button.disabled = selected_index == last_index
         finally:
             self._syncing_gui = False
+
+    def _sync_keyframe_options(self) -> None:
+        """Synchronise the selected-keypoint widgets after a key/name change."""
+        self.selected_gui.options = tuple(self.keyframes)
+        self.selected_gui.value = self.selection
+
+    def _move_selected(self, offset: int, *, first: bool = False, last: bool = False) -> None:
+        """Move the selected keyframe while retaining its data and name."""
+        with self.lock:
+            names = list(self.keyframes)
+            current_index = names.index(self.selection)
+            destination = 0 if first else len(names) - 1 if last else current_index + offset
+            destination = max(0, min(destination, len(names) - 1))
+            if destination == current_index:
+                return
+            name = names.pop(current_index)
+            names.insert(destination, name)
+            self.keyframes = {keyframe_name: self.keyframes[keyframe_name] for keyframe_name in names}
+            self.course["waypoints"]["keyframes"] = self.keyframes
+            self._sync_keyframe_options()
+            self._refresh_gui()
+            self._redraw_scene()
+
+    def _rename_selected(self) -> None:
+        if self._syncing_gui:
+            return
+        with self.lock:
+            old_name = self.selection
+            new_name = self.name_gui.value.strip()
+            if new_name == old_name:
+                return
+            if not new_name or "/" in new_name or "\\" in new_name:
+                self.status.content = "Keypoint name must be non-empty and cannot contain a slash."
+            elif new_name in self.keyframes:
+                self.status.content = f"A keypoint named `{new_name}` already exists."
+            else:
+                self.keyframes = {
+                    (new_name if keyframe_name == old_name else keyframe_name): keyframe
+                    for keyframe_name, keyframe in self.keyframes.items()
+                }
+                self.course["waypoints"]["keyframes"] = self.keyframes
+                self.selection = new_name
+                self._sync_keyframe_options()
+                self._refresh_gui()
+                self._redraw_scene()
+                return
+            # Restore the canonical selected name after an invalid edit.
+            self._syncing_gui = True
+            try:
+                self.name_gui.value = old_name
+            finally:
+                self._syncing_gui = False
 
     def _set_time(self, value: float) -> None:
         if not self._syncing_gui:
@@ -305,7 +381,11 @@ class CourseEditor:
                     _from_editor_value(row, float(value) / self.scene_scale)
                     for row, value in enumerate(gizmo.position)
                 )
-                frame["fo"][3][0] = _from_editor_value(3, _wxyz_to_yaw(gizmo.wxyz))
+                rendered_yaw = _unwrap_angle(
+                    _wxyz_to_yaw(gizmo.wxyz),
+                    _to_editor_value(3, float(frame["fo"][3][0])),
+                )
+                frame["fo"][3][0] = _from_editor_value(3, rendered_yaw)
                 self._refresh_gui()
                 # Updating the visible frame does not require recreating the gizmo mid-drag.
                 self.pose_handles[self.selection].position = gizmo.position
