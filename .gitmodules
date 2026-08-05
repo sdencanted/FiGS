@@ -6,4 +6,4 @@
 	url = https://github.com/sdencanted/nerfstudio
 [submodule "v2e"]
 	path = v2e
-	url = https://github.com/SensorsINI/v2e
+	url = https://github.com/sdencanted/v2e
