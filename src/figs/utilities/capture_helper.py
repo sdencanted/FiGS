@@ -4,6 +4,7 @@ Helper functions for capture generation.
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 def distribute_values(values,num_picks):
     values = np.array(values)
@@ -52,7 +53,7 @@ def compute_ransac_transform(W1:np.ndarray, W2:np.ndarray,
     best_inliers = 0
     co,Ro,to = None,None,None
 
-    for _ in range(max_iterations):
+    for _ in tqdm(range(max_iterations)):
         # Randomly sample 3 points
         idx = np.random.choice(N, n_batch, replace=False)
         W1_sample = W1[:, idx]
@@ -105,7 +106,7 @@ def compute_ransac_transform(W1:np.ndarray, W2:np.ndarray,
 
     print(f"RANSAC: {best_inliers} inliers out of {N} points with threshold {threshold}m")
     
-    return co,Ro,to
+    return co.copy(),Ro.copy(),to.copy()
 
 def compute_default_transform(X:np.ndarray, Y:np.ndarray) -> np.ndarray:
     X = torch.tensor(X, dtype=torch.float32)

@@ -387,7 +387,6 @@ def KF_to_TpFO(KF:dict,Ndr:int|None) -> tuple[np.ndarray,np.ndarray]:
                     FO[i][j].append(val)
                 else:
                     FO[i,j,k] = val
-
     return Tp,FO
 
 def dTPn_to_FO(Ts:np.ndarray,dT:np.ndarray,Pn:np.ndarray,Ndr:int=4) -> tuple[np.ndarray,np.ndarray]:

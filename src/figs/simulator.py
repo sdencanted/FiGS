@@ -39,7 +39,7 @@ class Simulator:
         # Check if gsplat is a string or GSplat object
         if isinstance(gsplat, str):
             gsplat = ch.get_gsplat(gsplat)
-        
+
         # Check if rollout is a string or dictionary
         if isinstance(method, str):
             method = ch.get_config(method, "methods")

@@ -36,6 +36,21 @@ class GSplat():
         self.config,self.pipeline, _, _ = eval_setup(gsplat_path,test_mode="inference")
         self.Tw2g = Tw2g
 
+    @classmethod
+    def from_pipeline(cls, config, pipeline) -> "GSplat":
+        """Wrap an already-loaded Nerfstudio pipeline without loading it again."""
+        gsplat = cls.__new__(cls)
+        gsplat.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        gsplat.config = config
+        gsplat.pipeline = pipeline
+        gsplat.Tw2g = np.array([
+            [ 1.00, 0.00, 0.00, 0.00],
+            [ 0.00,-1.00, 0.00, 0.00],
+            [ 0.00, 0.00,-1.00, 0.00],
+            [ 0.00, 0.00, 0.00, 1.00],
+        ])
+        return gsplat
+
     def generate_output_camera(self, camera_config:Dict[str,Union[int,float]]) -> Cameras:
         """
         Generate an output camera for the pipeline.
