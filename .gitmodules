@@ -1,6 +1,6 @@
 [submodule "acados"]
 	path = acados
-	url = https://github.com/StanfordMSL/acados.git
+	url = https://github.com/sdencanted/acados.git
 [submodule "nerfstudio"]
 	path = nerfstudio
 	url = https://github.com/sdencanted/nerfstudio
