@@ -380,62 +380,62 @@ def generate_gsplat(scene_file_name: str, capture_cfg_name: str = 'default',
         if not use_images:
             raise ValueError("rig reconstruction requires use_images=True.")
 
-        logger.info("Processing flat camera rig with Nerfstudio rig bundle adjustment")
-        ns_obj = ImagesToNerfstudioDataset(
-            data=images_path,
-            output_dir=sfm_path,
-            camera_type=reconstruction_config.get("camera_type", "perspective"),
-            matching_method=reconstruction_config.get("matching_method", "sequential"),
-            sfm_tool=reconstruction_config.get("sfm_tool", "colmap"),
-            gpu=reconstruction_config.get("gpu", True),
-            num_downscales=reconstruction_config.get("num_downscales", 0),
-            use_single_camera_mode=False,
-            use_rig=True,
-            matcher_type=reconstruction_config.get("matcher_type", "superpoint+lightglue"),
-            feature_type=reconstruction_config.get("feature_type", "superpoint+lightglue"),
-        )
-        ns_obj.main()
-        shutil.copy2(sfm_spc_path, spc_path)
-        shutil.copy2(sfm_tfm_path, tfm_path)
+        # logger.info("Processing flat camera rig with Nerfstudio rig bundle adjustment")
+        # ns_obj = ImagesToNerfstudioDataset(
+        #     data=images_path,
+        #     output_dir=sfm_path,
+        #     camera_type=reconstruction_config.get("camera_type", "perspective"),
+        #     matching_method=reconstruction_config.get("matching_method", "sequential"),
+        #     sfm_tool=reconstruction_config.get("sfm_tool", "colmap"),
+        #     gpu=reconstruction_config.get("gpu", True),
+        #     num_downscales=reconstruction_config.get("num_downscales", 0),
+        #     use_single_camera_mode=False,
+        #     use_rig=True,
+        #     matcher_type=reconstruction_config.get("matcher_type", "superpoint+lightglue"),
+        #     feature_type=reconstruction_config.get("feature_type", "superpoint+lightglue"),
+        # )
+        # ns_obj.main()
+        # shutil.copy2(sfm_spc_path, spc_path)
+        # shutil.copy2(sfm_tfm_path, tfm_path)
 
         
 
-        # Load the resulting transforms.json and sparse_points.ply
-        with open(sfm_tfm_path, "r") as f:
-            tfm_data = json.load(f)
+        # # Load the resulting transforms.json and sparse_points.ply
+        # with open(sfm_tfm_path, "r") as f:
+        #     tfm_data = json.load(f)
         
-        sparse_pcloud = o3d.io.read_point_cloud(sfm_spc_path.as_posix())
+        # sparse_pcloud = o3d.io.read_point_cloud(sfm_spc_path.as_posix())
 
-        # Rig transforms carry calibration on each frame, since every camera has
-        # its own intrinsics. Use those values when estimating marker poses.
-        logger.info("Extracting camera and marker positions from rig transforms")
-        Psfm, Parc = extract_positions(sfm_path, extractor_config, None)
-        logger.info(f"Extracted {Psfm.shape[1]} camera positions and {Parc.shape[1]} marker positions")
-        cs, Rs, ts = ch.compute_ransac_transform(Psfm, Parc)
-        logger.info(f"Computed RANSAC transform: scale={cs}, rotation=\n{Rs}, translation={ts}")
-        for frame in tqdm(tfm_data["frames"], desc="Updating camera transforms"):
-            Tc2s = np.array(frame["transform_matrix"])
+        # # Rig transforms carry calibration on each frame, since every camera has
+        # # its own intrinsics. Use those values when estimating marker poses.
+        # logger.info("Extracting camera and marker positions from rig transforms")
+        # Psfm, Parc = extract_positions(sfm_path, extractor_config, None)
+        # logger.info(f"Extracted {Psfm.shape[1]} camera positions and {Parc.shape[1]} marker positions")
+        # cs, Rs, ts = ch.compute_ransac_transform(Psfm, Parc)
+        # logger.info(f"Computed RANSAC transform: scale={cs}, rotation=\n{Rs}, translation={ts}")
+        # for frame in tqdm(tfm_data["frames"], desc="Updating camera transforms"):
+        #     Tc2s = np.array(frame["transform_matrix"])
 
-            Tc2w = np.eye(4)
-            Tc2w[:3, :3] = Rs @ Tc2s[:3, :3]
-            Tc2w[:3, 3] = cs * Rs @ Tc2s[:3, 3] + ts
-            frame["transform_matrix"] = Tc2w.tolist()
-        logger.info("Updated camera transforms with RANSAC alignment")
-        sparse_points = np.asarray(sparse_pcloud.points)
-        logger.info(f"Transforming {sparse_points.shape[0]} sparse points with RANSAC alignment")
-        if len(sparse_points):
-            logger.info("Applying RANSAC transform to sparse point cloud")
-            transformed_points = (cs * (Rs @ sparse_points.T)).T + ts
-            logger.info("Transformed sparse point cloud with RANSAC alignment")
-            transformed_points = np.ascontiguousarray(transformed_points, dtype=np.float64)
-            sparse_pcloud.points = o3d.utility.Vector3dVector(
-                transformed_points
-            )
-        logger.info("Transformed sparse point cloud with RANSAC alignment")
-        with open(tfm_path, "w", encoding="utf8") as f:
-            json.dump(tfm_data, f, indent=4)
-        logger.info(f"Saved updated transforms.json to {tfm_path}")
-        o3d.io.write_point_cloud(spc_path.as_posix(), sparse_pcloud)
+        #     Tc2w = np.eye(4)
+        #     Tc2w[:3, :3] = Rs @ Tc2s[:3, :3]
+        #     Tc2w[:3, 3] = cs * Rs @ Tc2s[:3, 3] + ts
+        #     frame["transform_matrix"] = Tc2w.tolist()
+        # logger.info("Updated camera transforms with RANSAC alignment")
+        # sparse_points = np.asarray(sparse_pcloud.points)
+        # logger.info(f"Transforming {sparse_points.shape[0]} sparse points with RANSAC alignment")
+        # if len(sparse_points):
+        #     logger.info("Applying RANSAC transform to sparse point cloud")
+        #     transformed_points = (cs * (Rs @ sparse_points.T)).T + ts
+        #     logger.info("Transformed sparse point cloud with RANSAC alignment")
+        #     transformed_points = np.ascontiguousarray(transformed_points, dtype=np.float64)
+        #     sparse_pcloud.points = o3d.utility.Vector3dVector(
+        #         transformed_points
+        #     )
+        # logger.info("Transformed sparse point cloud with RANSAC alignment")
+        # with open(tfm_path, "w", encoding="utf8") as f:
+        #     json.dump(tfm_data, f, indent=4)
+        # logger.info(f"Saved updated transforms.json to {tfm_path}")
+        # o3d.io.write_point_cloud(spc_path.as_posix(), sparse_pcloud)
     # Check if this is a multi-camera folder
     elif is_multi_camera_folder(images_path):
         logger.info(f"Detected multi-camera folder with {len(get_camera_images(images_path))} cameras")
@@ -545,26 +545,60 @@ def generate_gsplat(scene_file_name: str, capture_cfg_name: str = 'default',
             desired_image_path.symlink_to(existing_image_path.resolve(), target_is_directory=True)
 
     # Run the gsplat generation
-    command = [
+    # command = [
+    #     "ns-train",
+    #     "splatfacto-big",
+    #     "--pipeline.datamanager.cache-images", "disk",
+    #     "--data", scene_file_name,
+    #     "--viewer.quit-on-train-completion", "True",
+    #     "--output-dir", 'outputs',
+    #     "--pipeline.model.camera-optimizer.mode", "SO3xR3",
+        
+    #     "--max-num-iterations", "200000" ,
+    #     "--pipeline.model.stop-split-at", "150000" ,
+    #     "--pipeline.model.reset-alpha-every", "500",
+    #     "--pipeline.model.use-scale-regularization", "True",
+    #     "--optimizers.means.scheduler.max-steps", "200000",
+    #     "nerfstudio-data",
+    #     "--orientation-method", "none",
+    #     "--center-method", "none",
+    #     "--auto-scale-poses", "False",
+    #             # "--max-num-iterations", "60000" ,
+    #     # "--pipeline.model.densify-grad-thresh", "0.00015" ,
+    #     # "--pipeline.model.stop-split-at", "45000" ,
+    #     # "--pipeline.model.cull-alpha-thresh", "0.002" , causes bad letters
+    #     # "--pipeline.model.max-gs-num", "4000000",
+
+    # ]
+    command=[
         "ns-train",
-        "splatfacto",
+        "splatfacto-big",
+
         "--pipeline.datamanager.cache-images", "disk",
         "--data", scene_file_name,
         "--viewer.quit-on-train-completion", "True",
-        "--output-dir", 'outputs',
+        "--output-dir", "outputs",
+
         "--pipeline.model.camera-optimizer.mode", "SO3xR3",
-        
-        "--max-num-iterations", "60000" ,
+
+        "--max-num-iterations", "200000",
+
+        # Densification
+        "--pipeline.model.stop-split-at", "50000",
+        "--pipeline.model.reset-alpha-every", "500",
+
         "--pipeline.model.densify-grad-thresh", "0.00015" ,
-        "--pipeline.model.stop-split-at", "45000" ,
-        # "--pipeline.model.cull-alpha-thresh", "0.002" , causes bad letters
+        "--pipeline.model.cull-alpha-thresh", "0.002" , #causes bad letters
+        # Regularization
         "--pipeline.model.use-scale-regularization", "True",
-        # "--pipeline.model.max-gs-num", "4000000",
+
+        # Keep LR schedule aligned with full training
+        "--optimizers.means.scheduler.max-steps", "200000",
+
         "nerfstudio-data",
         "--orientation-method", "none",
         "--center-method", "none",
         "--auto-scale-poses", "False",
-
     ]
 
     def run_command_live_output(cmd):

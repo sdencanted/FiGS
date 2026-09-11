@@ -162,6 +162,7 @@ class VehicleRateMPC(BaseController):
         # Controller Specific Variables
         self.Nx,self.Nu = nx,nu
         self.Tsd,self.FOd = Tsd,FOd
+        self.Tkf = mts.Tkf
         self.tXUd,self.fex = tXUd,fex
         self.p = p
         self.Qk,self.Rk,self.QN = Qk,Rk,QN

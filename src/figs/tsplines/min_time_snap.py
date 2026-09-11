@@ -5,6 +5,7 @@ from scipy.optimize import minimize
 import sys
 import figs.utilities.polynomial_helper as ph
 import figs.utilities.transform_helper as th
+from figs.utilities.course_timing import BASE_TIME_WEIGHT, estimate_times, timing_settings
 
 # Debugging
 np.set_printoptions(threshold=sys.maxsize)
@@ -25,7 +26,8 @@ class MinTimeSnap():
         Initialize the class with waypoints and sampling frequency.
 
         Args:
-            WPs:            Dictionary containing the course configuration.
+            WPs:            Waypoints and optional course timing settings. Explicit
+                            timing settings override kT and use_l2_time below.
             hz:             Sampling frequency.
             kT:             Minimum time weight (None if only minimum snap).
             use_l2_time:    Use L2 time cost (True) or L1 time cost (False).
@@ -39,8 +41,25 @@ class MinTimeSnap():
         Nfo,Ncd = len(Kdr),len(Tau)
 
         # Extract Flat Output Variables (Tp guess and FO desired)
-        Tkf0,FOkf = th.KF_to_TpFO(WPs["keyframes"],Ndr)
+        keyframes = WPs["keyframes"]
+        self.total_duration = None
+        if "timing" in WPs:
+            timing = timing_settings(WPs["timing"])
+            estimates = estimate_times(keyframes,timing,bnds)
+            keyframes = {name: {**frame, "t": arrival}
+                         for (name,frame),arrival in zip(keyframes.items(),estimates)}
+            use_l2_time = False
+            if timing["mode"] == "automatic":
+                kT = BASE_TIME_WEIGHT * timing["aggressiveness"]
+            elif timing["mode"] == "manual":
+                kT = None
+            else:
+                kT = 0.0
+                self.total_duration = timing["total_duration"]
+        Tkf0,FOkf = th.KF_to_TpFO(keyframes,Ndr)
         dT0 = np.diff(Tkf0)
+        if len(dT0) == 0 or not np.all(np.isfinite(dT0)) or np.any(dT0 <= 0):
+            raise ValueError("At least two keyframes with increasing finite times are required")
 
         # Class compute variables
         self.Kdr,self.Ndr = Kdr,Ndr
@@ -86,11 +105,21 @@ class MinTimeSnap():
 
         # Solve the Time Snap QP
         if kT is not None:
+            constraints = ()
+            if self.total_duration is not None:
+                constraints = ({'type': 'eq',
+                                'fun': lambda dT: np.sum(dT) - self.total_duration,
+                                'jac': lambda dT: np.ones_like(dT)},)
             res = minimize(
                 lambda dT: self.time_snap_cost(dT, FOkf, kT),
                 x0=dT0, bounds=Bnds, method='SLSQP',
+                constraints=constraints,
                 options={'maxiter': 100, 'disp': False}
             )
+            if not res.success or not np.all(np.isfinite(res.x)):
+                raise ValueError(f"Trajectory timing optimization failed: {res.message}")
+            if self.total_duration is not None and not np.isclose(np.sum(res.x),self.total_duration,atol=1e-5,rtol=0):
+                raise ValueError("Trajectory timing optimization did not preserve total duration")
             dT = res.x
         else:
             dT = dT0
@@ -127,7 +156,7 @@ class MinTimeSnap():
 
         J = snap_cost + time_cost
 
-        return J
+        return J.item()
         
     def solve_uqp(self,dT:np.ndarray,FOkf:np.ndarray):
         """
@@ -335,4 +364,3 @@ class MinTimeSnap():
         
         # Return the velocity statistics
         return v_mean,v_std,v_max
-    

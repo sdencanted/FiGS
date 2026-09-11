@@ -10,19 +10,26 @@ Run from an environment with FiGS and viser installed, for example::
 The first command edits the supplied file in place when ``Save JSON`` is
 pressed.  Supplying ``--output`` writes to that path instead.  A new course is
 created when ``--input`` is omitted.
+
+Timing defaults to automatic estimation and optimization. Manual waypoint
+times and a fixed total duration are available in the Timing folder. Solve
+trajectory previews arrival times and sampled control checks without a scene.
+Saved timing settings also apply to downstream trajectory generation.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import threading
 import time
-import tempfile
 from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any
+
+from figs.utilities.course_timing import TIMING_MODES, estimate_times, timing_settings
 
 
 _ROWS = ("x", "y", "z", "yaw")
@@ -43,11 +50,12 @@ def _new_course() -> dict[str, Any]:
     """Return a minimal, solver-compatible course with two editable poses."""
     frame = {
         "t": 0.0,
-        "fo": [[0.0, None, None, None], [0.0, None, None, None], [0.0, None, None, None], [0.0, None, None, None]],
+        "fo": [[0.0, 0.0, 0.0, None] for _ in _ROWS],
     }
     return {
         "waypoints": {
             "Nco": 6,
+            "timing": timing_settings(),
             "keyframes": {"fo0": frame, "fo1": {**frame, "t": 1.0, "fo": [row.copy() for row in frame["fo"]]}},
         },
         "forces": None,
@@ -73,12 +81,13 @@ def _normalise_course(course: MutableMapping[str, Any]) -> tuple[dict[str, Any],
         raise ValueError("course must contain waypoints.keyframes") from exc
     if not isinstance(waypoints, MutableMapping) or not isinstance(keyframes, MutableMapping) or not keyframes:
         raise ValueError("waypoints.keyframes must be a non-empty object")
+    waypoints["timing"] = timing_settings(waypoints.get("timing"))
 
     derivative_count = _MIN_DERIVATIVES
     for name, keyframe in keyframes.items():
         if not isinstance(keyframe, MutableMapping):
             raise ValueError(f"keyframe {name!r} must be an object")
-        keyframe["t"] = _as_number_or_none(keyframe.get("t"), f"keyframe {name}.t")
+        keyframe["t"] = _as_number_or_none(keyframe.get("t", 0.0), f"keyframe {name}.t")
         if keyframe["t"] is None:
             raise ValueError(f"keyframe {name}.t must be a number")
         fo = keyframe.get("fo")
@@ -138,6 +147,10 @@ class CourseEditor:
         self.server = server if server is not None else viser.ViserServer(host=host, port=port)
         self.scene_scale = scene_scale
         self.gsplat = gsplat
+        self.timing = self.course["waypoints"].setdefault("timing", timing_settings())
+        self._manual_arrivals = {name: frame["t"] for name, frame in self.keyframes.items()}
+        self.optimized_times: list[float] | None = None
+        self._revision = 0
         self.lock = threading.RLock()
         self._syncing_gui = False
         self.pose_handles: dict[str, Any] = {}
@@ -169,6 +182,8 @@ class CourseEditor:
             self.delete_button.on_click(lambda _: self._delete_selected())
             self.save_button = self.server.gui.add_button("Save JSON", color="green")
             self.save_button.on_click(lambda _: self._save())
+            self.solve_button = self.server.gui.add_button("Solve trajectory")
+            self.solve_button.on_click(lambda _: self._solve_timing())
             self.simulate_button = self.server.gui.add_button(
                 "Run FiGS simulation", disabled=self.gsplat is None,
                 hint="Run the Section 4 FiGS simulator using the current course and Gaussian splat.",
@@ -177,6 +192,24 @@ class CourseEditor:
             self.route_toggle_button = self.server.gui.add_button("Show simulated trajectory", disabled=True)
             self.route_toggle_button.on_click(lambda _: self._toggle_route_display())
             self.status = self.server.gui.add_markdown("")
+
+        with self.server.gui.add_folder("Timing"):
+            self.timing_mode_gui = self.server.gui.add_dropdown(
+                "Timing mode", tuple(TIMING_MODES.values()), initial_value=TIMING_MODES[self.timing["mode"]],
+            )
+            self.timing_mode_gui.on_update(lambda _: self._set_timing())
+            self.aggressiveness_gui = self.server.gui.add_number(
+                "Aggressiveness", initial_value=self.timing["aggressiveness"], min=0.01, step=0.1,
+                hint="1 is the default. Higher values favor faster flight; this is not a speed limit.",
+            )
+            self.aggressiveness_gui.on_update(lambda _: self._set_timing())
+            self.total_duration_gui = self.server.gui.add_number(
+                "Total duration (s)", initial_value=self.timing["total_duration"], min=0.01, step=0.5,
+            )
+            self.total_duration_gui.on_update(lambda _: self._set_timing())
+            self.timing_description = self.server.gui.add_markdown("")
+            self.arrival_times_gui = self.server.gui.add_markdown("")
+            self.feasibility_gui = self.server.gui.add_markdown("")
 
         with self.server.gui.add_folder("Simulation display"):
             self.speed_marker_period_gui = self.server.gui.add_number(
@@ -218,6 +251,132 @@ class CourseEditor:
                 self.value_guis.append(row_guis)
         self._refresh_gui()
 
+    def _refresh_timing(self) -> None:
+        mode = self.timing["mode"]
+        self.time_gui.disabled = mode != "manual"
+        self.time_gui.label = "Arrival time (s)" if mode == "manual" else "Initial estimate (s)"
+        self.aggressiveness_gui.visible = mode == "automatic"
+        self.total_duration_gui.visible = mode == "total_duration"
+        descriptions = {
+            "automatic": "Arrival times are chosen automatically. Estimates update with the course; aggressiveness balances smoothness and duration.",
+            "manual": "Advanced: fix each arrival time. Start at 0 and increase times in keypoint order. The solver optimizes smoothness with these times fixed.",
+            "total_duration": "Fix the total flight duration. The solver distributes this time between keypoints to minimize the smoothness cost.",
+        }
+        self.timing_description.content = descriptions[mode]
+        try:
+            estimates = estimate_times(self.keyframes, self.timing)
+        except ValueError as exc:
+            self.arrival_times_gui.content = f"**Timing needs attention:** {exc}"
+            return
+        if mode != "manual":
+            for frame, estimate in zip(self.keyframes.values(), estimates):
+                frame["t"] = estimate
+        heading = "Fixed arrival (s)" if mode == "manual" else "Initial estimate (s)"
+        rows = [f"| Keypoint | {heading} | Solved arrival (s) |", "|---|---:|---:|"]
+        for index, (name, estimate) in enumerate(zip(self.keyframes, estimates)):
+            solved = "—" if self.optimized_times is None else f"{self.optimized_times[index]:.3f}"
+            safe_name = name.replace("|", "\\|").replace("\n", " ")
+            rows.append(f"| {safe_name} | {estimate:.3f} | {solved} |")
+        self.arrival_times_gui.content = "\n".join(rows)
+
+    def _set_timing(self) -> None:
+        if self._syncing_gui:
+            return
+        with self.lock:
+            value = {
+                "mode": next(mode for mode, label in TIMING_MODES.items() if label == self.timing_mode_gui.value),
+                "aggressiveness": self.aggressiveness_gui.value,
+                "total_duration": self.total_duration_gui.value,
+            }
+            try:
+                settings = timing_settings(value)
+            except ValueError as exc:
+                self._refresh_gui()
+                self.status.content = str(exc)
+                return
+            if self.timing["mode"] == "manual":
+                self._manual_arrivals = {name: frame["t"] for name, frame in self.keyframes.items()}
+            elif settings["mode"] == "manual":
+                for name, frame in self.keyframes.items():
+                    frame["t"] = self._manual_arrivals.get(name, frame["t"])
+            self.timing = settings
+            self.course["waypoints"]["timing"] = self.timing
+            self._course_changed()
+
+    def _course_changed(self) -> None:
+        """Invalidate results so they cannot be mistaken for the edited course."""
+        self._revision += 1
+        self.optimized_times = None
+        self.simulated_tro = self.simulated_xro = self.simulated_rgb = None
+        self.simulation_hz = None
+        self.show_simulated_trajectory = False
+        self.route_toggle_button.disabled = self.export_video_button.disabled = True
+        self.route_toggle_button.label = "Show simulated trajectory"
+        self.feasibility_gui.content = ""
+        self.status.content = "Course changed. Solve or simulate to update the results."
+        self._refresh_gui()
+        self._update_route()
+
+    def _validated_course(self) -> dict[str, Any]:
+        """Snapshot the course, validating timing before saving or planning."""
+        course = copy.deepcopy(self.course)
+        course, _ = _normalise_course(course)
+        times = estimate_times(course["waypoints"]["keyframes"], course["waypoints"]["timing"])
+        for frame, arrival in zip(course["waypoints"]["keyframes"].values(), times):
+            frame["t"] = arrival
+        return course
+
+    def _reference_report(self, flat_outputs: Any, reference: Any, lower: Any, upper: Any) -> str:
+        """Report sampled reference demands against the simulation pilot limits."""
+        np = self.np
+        if not np.all(np.isfinite(flat_outputs)) or not np.all(np.isfinite(reference)):
+            raise ValueError("The planned trajectory contains non-finite states or controls; revise its constraints or timing")
+        controls = reference[:, -4:]
+        exceeded = np.any((controls < np.asarray(lower) - 1e-6) | (controls > np.asarray(upper) + 1e-6), axis=0)
+        labels = ("thrust", "roll rate", "pitch rate", "yaw rate")
+        violations = ", ".join(label for label, failed in zip(labels, exceeded) if failed)
+        result = f"**Control limits exceeded:** {violations}. Reduce aggressiveness or allow more time." if violations else "Sampled reference controls are within Viper's limits for carl."
+        speed = np.linalg.norm(flat_outputs[:, :3, 1], axis=1).max()
+        acceleration = np.linalg.norm(flat_outputs[:, :3, 2], axis=1).max()
+        yaw_rate = np.abs(flat_outputs[:, 3, 1]).max()
+        return f"{result}\n\nPeak sampled speed: **{speed:.2f} m/s**; acceleration: **{acceleration:.2f} m/s²**; yaw rate: **{yaw_rate:.2f} rad/s**.\n\nThese are sampled control checks; obstacle clearance is not checked."
+
+    def _solve_timing(self) -> None:
+        self.solve_button.disabled = True
+        self.status.content = "Solving trajectory…"
+        try:
+            with self.lock:
+                course = self._validated_course()
+                revision = self._revision
+            from figs.tsplines.min_time_snap import MinTimeSnap
+            from figs.utilities import transform_helper as th
+            from figs.dynamics.external_forces import ExternalForces
+
+            # Use the same config root and presets as the editor simulation,
+            # without importing the splat renderer for a trajectory-only solve.
+            config_root = Path(__file__).resolve().parents[4] / "configs"
+            with (config_root / "pilots/Viper.json").open(encoding="utf-8") as file:
+                policy = json.load(file)
+            with (config_root / "frames/carl.json").open(encoding="utf-8") as file:
+                frame = json.load(file)
+            mts = MinTimeSnap(course["waypoints"], 100, policy["plan"]["kT"], policy["plan"]["use_l2_time"])
+            times, outputs = mts.get_desired_trajectory()
+            reference = th.TsFO_to_tXU(times, outputs, frame["mass"], frame["motor_thrust_coeff"], ExternalForces(course.get("forces")))
+            bounds = policy["track"]["bounds"]
+            report = self._reference_report(outputs, reference, bounds["lower"], bounds["upper"])
+            with self.lock:
+                if revision != self._revision:
+                    self.status.content = "Course changed during the solve. Solve again to update the results."
+                    return
+                self.optimized_times = mts.Tkf.tolist()
+                self.feasibility_gui.content = report
+                self._refresh_gui()
+                self.status.content = f"Trajectory solved. Duration: {mts.Tkf[-1]:.3f} s."
+        except Exception as exc:
+            self.status.content = f"Trajectory solve failed: {exc}"
+        finally:
+            self.solve_button.disabled = False
+
     def _current(self) -> dict[str, Any]:
         return self.keyframes[self.selection]
 
@@ -234,6 +393,10 @@ class CourseEditor:
     def _refresh_gui(self) -> None:
         self._syncing_gui = True
         try:
+            self.timing_mode_gui.value = TIMING_MODES[self.timing["mode"]]
+            self.aggressiveness_gui.value = self.timing["aggressiveness"]
+            self.total_duration_gui.value = self.timing["total_duration"]
+            self._refresh_timing()
             frame = self._current()
             self.name_gui.value = self.selection
             self.time_gui.value = float(frame["t"])
@@ -274,7 +437,7 @@ class CourseEditor:
             self.keyframes = {keyframe_name: self.keyframes[keyframe_name] for keyframe_name in names}
             self.course["waypoints"]["keyframes"] = self.keyframes
             self._sync_keyframe_options()
-            self._refresh_gui()
+            self._course_changed()
             self._redraw_scene()
 
     def _rename_selected(self) -> None:
@@ -290,6 +453,8 @@ class CourseEditor:
             elif new_name in self.keyframes:
                 self.status.content = f"A keypoint named `{new_name}` already exists."
             else:
+                if old_name in self._manual_arrivals:
+                    self._manual_arrivals[new_name] = self._manual_arrivals.pop(old_name)
                 self.keyframes = {
                     (new_name if keyframe_name == old_name else keyframe_name): keyframe
                     for keyframe_name, keyframe in self.keyframes.items()
@@ -297,7 +462,7 @@ class CourseEditor:
                 self.course["waypoints"]["keyframes"] = self.keyframes
                 self.selection = new_name
                 self._sync_keyframe_options()
-                self._refresh_gui()
+                self._course_changed()
                 self._redraw_scene()
                 return
             # Restore the canonical selected name after an invalid edit.
@@ -308,9 +473,10 @@ class CourseEditor:
                 self._syncing_gui = False
 
     def _set_time(self, value: float) -> None:
-        if not self._syncing_gui:
+        if not self._syncing_gui and self.timing["mode"] == "manual":
             with self.lock:
                 self._current()["t"] = value
+                self._course_changed()
 
     def _set_specified(self, row: int, derivative: int) -> None:
         if self._syncing_gui:
@@ -319,12 +485,14 @@ class CourseEditor:
             specified, value = self.value_guis[row][derivative]
             self._current()["fo"][row][derivative] = float(value.value) if specified.value else None
             value.disabled = not specified.value
+            self._course_changed()
             self._redraw_scene()
 
     def _set_value(self, row: int, derivative: int) -> None:
         if not self._syncing_gui and self.value_guis[row][derivative][0].value:
             with self.lock:
                 self._current()["fo"][row][derivative] = float(self.value_guis[row][derivative][1].value)
+                self._course_changed()
                 if derivative == 0:
                     self._redraw_scene()
 
@@ -383,10 +551,10 @@ class CourseEditor:
                 )
                 rendered_yaw = _unwrap_angle(
                     _wxyz_to_yaw(gizmo.wxyz),
-                    _to_editor_value(3, float(frame["fo"][3][0])),
+                    _to_editor_value(3, float(frame["fo"][3][0] or 0.0)),
                 )
                 frame["fo"][3][0] = _from_editor_value(3, rendered_yaw)
-                self._refresh_gui()
+                self._course_changed()
                 # Updating the visible frame does not require recreating the gizmo mid-drag.
                 self.pose_handles[self.selection].position = gizmo.position
                 self.pose_handles[self.selection].wxyz = gizmo.wxyz
@@ -433,7 +601,7 @@ class CourseEditor:
         )
 
     def _refresh_simulation_render(self) -> None:
-        if self.simulated_tro is not None:
+        if self.show_simulated_trajectory and self.simulated_tro is not None:
             with self.lock:
                 self._draw_simulated_route()
 
@@ -476,8 +644,9 @@ class CourseEditor:
             self.export_video_button.disabled = False
 
     def _write_course(self, path: Path) -> None:
+        course = self._validated_course()
         with path.open("w", encoding="utf-8") as file:
-            json.dump(self.course, file, indent=2, allow_nan=False)
+            json.dump(course, file, indent=2, allow_nan=False)
             file.write("\n")
 
     def _run_simulation(self) -> None:
@@ -486,25 +655,27 @@ class CourseEditor:
             return
         self.simulate_button.disabled = True
         self.status.content = "Running FiGS simulation…"
-        temporary_path: Path | None = None
         try:
-            # The controller receives the serialized editor state, rather than
-            # a mutable reference to the live editor model.
             with self.lock:
-                with tempfile.NamedTemporaryFile(prefix="figs-course-editor-", suffix=".json", delete=False, mode="w", encoding="utf-8") as file:
-                    temporary_path = Path(file.name)
-                self._write_course(temporary_path)
-            with temporary_path.open(encoding="utf-8") as file:
-                simulation_course = json.load(file)
+                simulation_course = self._validated_course()
+                revision = self._revision
 
             from figs.control.vehicle_rate_mpc import VehicleRateMPC
             from figs.simulator import Simulator
 
             simulator = Simulator(self.gsplat, "eval_single", "carl")
+            simulator.update_forces(simulation_course.get("forces"))
             controller = VehicleRateMPC("Viper", simulation_course, "carl")
+            report = self._reference_report(controller.FOd, controller.tXUd, controller.lbu, controller.ubu)
             t0, tf = controller.tXUd[0, 0], controller.tXUd[-1, 0]
             tro, xro, _, _, rgb, _, _ = simulator.simulate(controller, t0, tf, controller.tXUd[0, 1:11])
             with self.lock:
+                if revision != self._revision:
+                    self.status.content = "Course changed during simulation. Run again to update the results."
+                    return
+                self.optimized_times = controller.Tkf.tolist()
+                self.feasibility_gui.content = report
+                self._refresh_gui()
                 self.simulated_tro = tro
                 self.simulated_xro = xro
                 self.simulated_rgb = rgb
@@ -519,39 +690,45 @@ class CourseEditor:
             self.status.content = f"Simulation failed: {exc}"
             print(f"Simulation failed: {exc}")
         finally:
-            if temporary_path is not None:
-                temporary_path.unlink(missing_ok=True)
             self.simulate_button.disabled = False
 
     def _add_keypoint(self) -> None:
         with self.lock:
             source = self._current()
-            new_name = f"fo{len(self.keyframes)}"
+            index = len(self.keyframes)
+            while f"fo{index}" in self.keyframes:
+                index += 1
+            new_name = f"fo{index}"
             new_fo = [row.copy() for row in source["fo"]]
-            self.keyframes[new_name] = {"t": float(source["t"]) + 1.0, "fo": new_fo}
+            last_time = float(next(reversed(self.keyframes.values()))["t"])
+            self.keyframes[new_name] = {"t": last_time + 1.0, "fo": new_fo}
             self.selection = new_name
             self.selected_gui.options = tuple(self.keyframes)
             self.selected_gui.value = new_name
-            self._refresh_gui()
+            self._course_changed()
             self._redraw_scene()
 
     def _delete_selected(self) -> None:
         with self.lock:
             if len(self.keyframes) <= 1:
                 return
+            self._manual_arrivals.pop(self.selection, None)
             del self.keyframes[self.selection]
             self.selection = next(iter(self.keyframes))
             self.selected_gui.options = tuple(self.keyframes)
             self.selected_gui.value = self.selection
-            self._refresh_gui()
+            self._course_changed()
             self._redraw_scene()
 
     def _save(self) -> None:
         with self.lock:
-            self.output_path.parent.mkdir(parents=True, exist_ok=True)
-            self._write_course(self.output_path)
-            self.status.content = f"Saved `{self.output_path}`"
-            print(f"Saved {self.output_path}")
+            try:
+                self.output_path.parent.mkdir(parents=True, exist_ok=True)
+                self._write_course(self.output_path)
+                self.status.content = f"Saved `{self.output_path}`"
+                print(f"Saved {self.output_path}")
+            except (OSError, ValueError) as exc:
+                self.status.content = f"Unable to save course: {exc}"
 
 
 def _parse_args() -> argparse.Namespace:
